@@ -1,12 +1,12 @@
-import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# ============================================================
+# CONFIG
+# ============================================================
 SHEET_NAME = "Traffic"
 
-
-# Canonical column names we want to end up with
 CANONICAL_COLS = [
     "Date",
     "User Unique Session",
@@ -19,7 +19,6 @@ CANONICAL_COLS = [
     "New User",
 ]
 
-# Aliases to fix common typos / trailing spaces
 ALIASES = {
     "Inlfuencer": "Influencer",
     "Influencer ": "Influencer",
@@ -45,39 +44,32 @@ METRIC_COLS = [
 ]
 
 # ============================================================
-# HELPERS
+# HELPERS: parsing, normalization
 # ============================================================
 def clean_colname(c: str) -> str:
     return str(c).strip()
 
 def parse_date(s: pd.Series) -> pd.Series:
-    # Accepts DD.MM.YYYY and ISO; dayfirst handles Turkish format safely.
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def to_number(s: pd.Series) -> pd.Series:
     """
-    Robust numeric parser for metrics that may look like:
-      - 76558
-      - "76.558" (TR thousands)
-      - "76,558" (thousands or decimal)
-      - " 76.558 "
-    Assumption: metrics are integers (counts), so remove '.' and ',' thousands separators.
+    Metrics are counts. Accepts:
+      - numeric
+      - "76.558" (TR thousands) -> 76558
+      - "76,558" -> 76558
     """
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
 
     x = s.astype(str).str.strip()
     x = x.str.replace(" ", "", regex=False)
-
-    # Remove thousands separators (both '.' and ',')
     x = x.str.replace(".", "", regex=False).str.replace(",", "", regex=False)
-
     return pd.to_numeric(x, errors="coerce")
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [clean_colname(c) for c in df.columns]
-    # Apply aliases if present
     rename_map = {k: v for k, v in ALIASES.items() if k in df.columns}
     if rename_map:
         df = df.rename(columns=rename_map)
@@ -88,8 +80,10 @@ def validate_contract(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(
             "Sheet column mismatch.\n"
-            f"Missing columns: {missing}\n\n"
-            f"Found columns: {list(df.columns)}"
+            f"Missing columns: {missing}\n"
+            f"Found columns: {list(df.columns)}\n\n"
+            "Beklenen kolonlar:\n"
+            + "\n".join(CANONICAL_COLS)
         )
 
 def add_time_dims(df: pd.DataFrame) -> pd.DataFrame:
@@ -103,8 +97,6 @@ def add_time_dims(df: pd.DataFrame) -> pd.DataFrame:
 
     df["year"] = df["date"].dt.year.astype(int)
     df["month"] = df["date"].dt.month.astype(int)
-
-    # month_start: first day of month
     df["month_start"] = df["date"].values.astype("datetime64[M]")
     df["year_month"] = df["year"].astype(str) + "-" + df["month"].astype(str).str.zfill(2)
 
@@ -112,31 +104,32 @@ def add_time_dims(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_from_excel(uploaded_file) -> pd.DataFrame:
+    # Ensure openpyxl exists; fail fast with readable error
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        raise ImportError("openpyxl missing. requirements.txt içine openpyxl eklenmeli.")
+
     df = pd.read_excel(uploaded_file, sheet_name=SHEET_NAME)
     df = normalize_columns(df)
     validate_contract(df)
 
-    # Parse date first
     df["Date"] = parse_date(df["Date"])
     df = df.dropna(subset=["Date"]).sort_values("Date")
 
-    # Parse metrics
     for c in METRIC_COLS:
         df[c] = to_number(df[c])
 
-    # Drop rows where core metrics are missing (optional: keep, but safer to drop)
+    # Optional: drop rows without core metrics
     df = df.dropna(subset=["Sessions", "User Unique Session"])
 
-    # Add time dimensions
     df = add_time_dims(df)
-
     return df
 
+# ============================================================
+# AGGREGATION
+# ============================================================
 def aggregate(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
-    """
-    granularity: 'Daily' | 'Weekly' | 'Monthly'
-    Returns: period_label + period_sort + summed metrics
-    """
     df = df.copy()
 
     if granularity == "Daily":
@@ -162,36 +155,185 @@ def aggregate(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
 
     raise ValueError("granularity must be one of: Daily, Weekly, Monthly")
 
-def apply_default_range(agg: pd.DataFrame, granularity: str, weeks_back: int = 8) -> pd.DataFrame:
-    agg = agg.copy()
+def apply_default_range(agg: pd.DataFrame, granularity: str, weeks_back: int) -> pd.DataFrame:
     agg = agg.sort_values("period_sort")
-
     if granularity == "Weekly":
         return agg.tail(weeks_back)
-
     if granularity == "Daily":
         return agg.tail(weeks_back * 7)
-
     if granularity == "Monthly":
-        return agg.tail(3)
-
+        # 8 hafta ~ 2 ay; biraz buffer ile 3 ay gösterelim
+        return agg.tail(max(3, int(np.ceil(weeks_back / 4))))
     return agg
 
 # ============================================================
-# STREAMLIT UI (STEP 3 VALIDATION)
+# COMPARE ENGINE (WoW / MoM / YoY)
 # ============================================================
-st.set_page_config(page_title="Trafik Dashboard - Step 3", layout="wide")
-st.title("Trafik Dashboard")
+def _safe_pct(curr: float, prev: float | None) -> float | None:
+    if prev is None or pd.isna(prev) or prev == 0 or pd.isna(curr):
+        return None
+    return (curr / prev - 1.0) * 100.0
 
-st.sidebar.header("Data Source")
-uploaded = st.sidebar.file_uploader("Upload grw_dash.xlsx", type=["xlsx"])
+def _pick_current_period(agg_view: pd.DataFrame) -> pd.Series:
+    agg_view = agg_view.sort_values("period_sort")
+    return agg_view.iloc[-1]
 
-# --- Prevent NoneType crash ---
-if uploaded is None:
-    st.info("Sol menüden Excel dosyasını yükleyin. Dosya yüklenmeden uygulama çalışmaz.")
-    st.stop()
+def _find_prev_row(agg_all: pd.DataFrame, current_row: pd.Series, granularity: str, compare_mode: str) -> pd.Series | None:
+    """
+    Returns a single previous period row for KPI delta.
+    compare_mode:
+      - WoW: previous period (daily uses previous day; but we'll apply to aggregated daily series; KPI uses last day vs prev day)
+      - MoM: previous month (monthly) or approximate (weekly/daily)
+      - YoY: same week/month/day previous year where possible
+    """
+    agg_all = agg_all.sort_values("period_sort")
 
-# Load
+    if compare_mode == "WoW":
+        # Previous period in the same granularity
+        idx = agg_all.index[agg_all["period_sort"] == current_row["period_sort"]]
+        if len(idx) == 0:
+            return None
+        pos = agg_all.index.get_loc(idx[0])
+        if pos - 1 < 0:
+            return None
+        return agg_all.iloc[pos - 1]
+
+    if compare_mode == "MoM":
+        if granularity == "Monthly":
+            idx = agg_all.index[agg_all["period"] == current_row["period"]]
+            if len(idx) == 0:
+                return None
+            pos = agg_all.index.get_loc(idx[0])
+            if pos - 1 < 0:
+                return None
+            return agg_all.iloc[pos - 1]
+
+        # For weekly/daily: map to "same period_sort minus ~4 weeks" (coarse but useful)
+        # Weekly: subtract 4 weeks in sort-key space is not safe across year boundary; use position shift of 4 instead.
+        # Daily: shift by ~30 days (position shift of 30) within daily aggregated series
+        shift = 4 if granularity == "Weekly" else 30
+        idx = agg_all.index[agg_all["period_sort"] == current_row["period_sort"]]
+        if len(idx) == 0:
+            return None
+        pos = agg_all.index.get_loc(idx[0])
+        if pos - shift < 0:
+            return None
+        return agg_all.iloc[pos - shift]
+
+    if compare_mode == "YoY":
+        if granularity == "Weekly":
+            # match same iso_week in previous iso_year
+            target_year = int(current_row["iso_year"]) - 1
+            target_week = int(current_row["iso_week"])
+            m = (agg_all["iso_year"] == target_year) & (agg_all["iso_week"] == target_week)
+            prev = agg_all.loc[m]
+            return prev.iloc[-1] if len(prev) else None
+
+        if granularity == "Monthly":
+            # match same month in previous year via year_month string
+            ym = str(current_row["period"])
+            year = int(ym.split("-")[0])
+            month = ym.split("-")[1]
+            target = f"{year-1}-{month}"
+            prev = agg_all.loc[agg_all["period"] == target]
+            return prev.iloc[-1] if len(prev) else None
+
+        if granularity == "Daily":
+            # match same calendar date previous year
+            # period_sort is datetime for daily
+            curr_date = pd.to_datetime(current_row["period_sort"])
+            target_date = curr_date - pd.DateOffset(years=1)
+            prev = agg_all.loc[agg_all["period_sort"] == target_date]
+            return prev.iloc[-1] if len(prev) else None
+
+    return None
+
+# ============================================================
+# KPI CALC + RENDER
+# ============================================================
+def calculate_kpis(current: pd.Series, previous: pd.Series | None) -> list[dict]:
+    def prev_val(col: str):
+        return previous[col] if previous is not None else None
+
+    kpis = [
+        {"name": "Total Unique Session", "value": float(current["User Unique Session"]), "prev": prev_val("User Unique Session")},
+        {"name": "Sessions", "value": float(current["Sessions"]), "prev": prev_val("Sessions")},
+        {"name": "Organic & Direct", "value": float(current["Organic&Direct"]), "prev": prev_val("Organic&Direct")},
+        {"name": "Paid", "value": float(current["Paid"]), "prev": prev_val("Paid")},
+        {"name": "Paid – Search", "value": float(current["Paid-Search"]), "prev": prev_val("Paid-Search")},
+        {"name": "Paid – Display", "value": float(current["Paid-Display"]), "prev": prev_val("Paid-Display")},
+        {"name": "Influencer", "value": float(current["Influencer"]), "prev": prev_val("Influencer")},
+    ]
+
+    # New User Rate
+    curr_uus = float(current["User Unique Session"]) if pd.notna(current["User Unique Session"]) else 0.0
+    curr_nu = float(current["New User"]) if pd.notna(current["New User"]) else 0.0
+    curr_rate = (curr_nu / curr_uus) if curr_uus else np.nan
+
+    if previous is not None:
+        prev_uus = float(previous["User Unique Session"]) if pd.notna(previous["User Unique Session"]) else 0.0
+        prev_nu = float(previous["New User"]) if pd.notna(previous["New User"]) else 0.0
+        prev_rate = (prev_nu / prev_uus) if prev_uus else np.nan
+    else:
+        prev_rate = None
+
+    kpis.append({"name": "New User Rate", "value": curr_rate, "prev": prev_rate})
+
+    # compute deltas
+    for k in kpis:
+        k["delta_pct"] = _safe_pct(k["value"], k["prev"])
+
+    return kpis
+
+def _fmt_int(x):
+    if x is None or pd.isna(x):
+        return "–"
+    return f"{int(round(x)):,}".replace(",", ".")
+
+def _fmt_rate(x):
+    if x is None or pd.isna(x):
+        return "–"
+    return f"{x*100:.1f}%"
+
+def render_kpis(kpis: list[dict], compare_label: str):
+    st.caption(f"Comparison: {compare_label}")
+
+    cols = st.columns(4)
+    for i, k in enumerate(kpis):
+        name = k["name"]
+        val = k["value"]
+        delta = k["delta_pct"]
+
+        if name == "New User Rate":
+            value_str = _fmt_rate(val)
+        else:
+            value_str = _fmt_int(val)
+
+        if delta is None:
+            delta_str = "N/A"
+            delta_color = "off"
+        else:
+            sign = "+" if delta >= 0 else ""
+            delta_str = f"{sign}{delta:.1f}%"
+            delta_color = "normal" if delta >= 0 else "inverse"
+
+        with cols[i % 4]:
+            st.metric(label=name, value=value_str, delta=delta_str, delta_color=delta_color)
+
+# ============================================================
+# UI
+# ============================================================
+st.set_page_config(page_title="GRW Dash - Trafik (Step 4)", layout="wide")
+st.title("GRW Dash — Trafik (Step 4)")
+
+with st.sidebar:
+    st.header("Data Source")
+    uploaded = st.file_uploader("Upload grw_dash.xlsx", type=["xlsx"])
+    if uploaded is None:
+        st.info("Excel dosyasını yükleyin. (Sheet adı: Traffic)")
+        st.stop()
+
+# Load data
 try:
     df_raw = load_from_excel(uploaded)
 except Exception as e:
@@ -199,147 +341,31 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-st.sidebar.header("Filters")
-granularity = st.sidebar.radio("Granularity", ["Weekly", "Daily", "Monthly"], index=0)
-weeks_back = st.sidebar.slider("Default range (weeks)", min_value=4, max_value=26, value=8, step=1)
+with st.sidebar:
+    st.header("Filters")
 
-agg = aggregate(df_raw, granularity=granularity)
-agg_view = apply_default_range(agg, granularity=granularity, weeks_back=weeks_back)
+    granularity = st.radio("Granularity", ["Weekly", "Daily", "Monthly"], index=0)
+    weeks_back = st.slider("Default range (weeks)", min_value=4, max_value=26, value=8, step=1)
 
-# --- Output previews ---
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.subheader("Raw preview (first 30)")
-    st.dataframe(df_raw.head(30), use_container_width=True)
-with c2:
-    st.subheader(f"Aggregated preview ({granularity}) - default range")
+    compare_mode = st.selectbox("Compare mode", ["WoW", "MoM", "YoY"], index=0)
+
+# Aggregate (all + view)
+agg_all = aggregate(df_raw, granularity=granularity)
+agg_view = apply_default_range(agg_all, granularity=granularity, weeks_back=weeks_back)
+
+# Current & Previous
+current_row = _pick_current_period(agg_view)
+previous_row = _find_prev_row(agg_all, current_row, granularity=granularity, compare_mode=compare_mode)
+
+# KPI compute + render
+st.subheader("Trafik — KPI Özeti")
+compare_label = f"{granularity} / {compare_mode}"
+kpis = calculate_kpis(current_row, previous_row)
+render_kpis(kpis, compare_label=compare_label)
+
+# Debug / Preview
+with st.expander("Aggregated preview (filtered)"):
     st.dataframe(agg_view, use_container_width=True)
 
-st.divider()
-st.subheader("Columns check")
-st.write("Detected columns:", list(pd.read_excel(uploaded, sheet_name=SHEET_NAME).columns))
-st.write("Normalized columns:", list(df_raw.columns))
-
-# ===============================
-# STEP 4 – Compare & KPI helpers
-# ===============================
-def get_current_and_previous(agg: pd.DataFrame) -> tuple[pd.Series, pd.Series | None]:
-    """
-    Returns:
-      current_row, previous_row
-    Assumes agg is already filtered to desired date range and sorted.
-    """
-    agg = agg.sort_values("period_sort")
-
-    if len(agg) < 2:
-        return agg.iloc[-1], None
-
-    return agg.iloc[-1], agg.iloc[-2]
-
-
-def pct_delta(curr: float, prev: float | None) -> float | None:
-    if prev is None or pd.isna(prev) or prev == 0:
-        return None
-    return (curr / prev - 1.0) * 100.0
-
-def calculate_kpis(current: pd.Series, previous: pd.Series | None) -> dict:
-    kpis = {}
-
-    def add_kpi(name, curr_val, prev_val):
-        kpis[name] = {
-            "value": curr_val,
-            "delta": pct_delta(curr_val, prev_val)
-        }
-
-    add_kpi(
-        "Total Unique Session",
-        current["User Unique Session"],
-        previous["User Unique Session"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Sessions",
-        current["Sessions"],
-        previous["Sessions"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Organic & Direct",
-        current["Organic&Direct"],
-        previous["Organic&Direct"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Paid",
-        current["Paid"],
-        previous["Paid"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Paid – Search",
-        current["Paid-Search"],
-        previous["Paid-Search"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Paid – Display",
-        current["Paid-Display"],
-        previous["Paid-Display"] if previous is not None else None,
-    )
-
-    add_kpi(
-        "Influencer",
-        current["Influencer"],
-        previous["Influencer"] if previous is not None else None,
-    )
-
-    # New User Rate
-    curr_rate = current["New User"] / current["User Unique Session"] if current["User Unique Session"] else None
-    prev_rate = (
-        previous["New User"] / previous["User Unique Session"]
-        if previous is not None and previous["User Unique Session"]
-        else None
-    )
-
-    add_kpi("New User Rate", curr_rate, prev_rate)
-
-    return kpis
-
-def format_value(name, value):
-    if value is None or pd.isna(value):
-        return "–"
-
-    if name == "New User Rate":
-        return f"{value:.1%}"
-
-    return f"{int(round(value)):,}".replace(",", ".")
-
-
-def format_delta(delta):
-    if delta is None:
-        return "N/A", "neutral"
-
-    sign = "+" if delta >= 0 else ""
-    color = "green" if delta >= 0 else "red"
-    return f"{sign}{delta:.1f}%", color
-
-
-def render_kpis(kpis: dict):
-    cols = st.columns(4)
-
-    for i, (name, data) in enumerate(kpis.items()):
-        with cols[i % 4]:
-            delta_text, color = format_delta(data["delta"])
-            st.metric(
-                label=name,
-                value=format_value(name, data["value"]),
-                delta=delta_text,
-                delta_color=color,
-            )
-
-current_row, previous_row = get_current_and_previous(agg_view)
-kpis = calculate_kpis(current_row, previous_row)
-
-st.subheader("Trafik – KPI Özeti")
-render_kpis(kpis)
-
+with st.expander("Raw preview (first 50)"):
+    st.dataframe(df_raw.head(50), use_container_width=True)
