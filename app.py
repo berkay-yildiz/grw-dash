@@ -3,10 +3,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ============================================================
-# CONFIG
-# ============================================================
 SHEET_NAME = "Traffic"
+
 
 # Canonical column names we want to end up with
 CANONICAL_COLS = [
@@ -221,3 +219,127 @@ st.divider()
 st.subheader("Columns check")
 st.write("Detected columns:", list(pd.read_excel(uploaded, sheet_name=SHEET_NAME).columns))
 st.write("Normalized columns:", list(df_raw.columns))
+
+# ===============================
+# STEP 4 – Compare & KPI helpers
+# ===============================
+def get_current_and_previous(agg: pd.DataFrame) -> tuple[pd.Series, pd.Series | None]:
+    """
+    Returns:
+      current_row, previous_row
+    Assumes agg is already filtered to desired date range and sorted.
+    """
+    agg = agg.sort_values("period_sort")
+
+    if len(agg) < 2:
+        return agg.iloc[-1], None
+
+    return agg.iloc[-1], agg.iloc[-2]
+
+
+def pct_delta(curr: float, prev: float | None) -> float | None:
+    if prev is None or pd.isna(prev) or prev == 0:
+        return None
+    return (curr / prev - 1.0) * 100.0
+
+def calculate_kpis(current: pd.Series, previous: pd.Series | None) -> dict:
+    kpis = {}
+
+    def add_kpi(name, curr_val, prev_val):
+        kpis[name] = {
+            "value": curr_val,
+            "delta": pct_delta(curr_val, prev_val)
+        }
+
+    add_kpi(
+        "Total Unique Session",
+        current["User Unique Session"],
+        previous["User Unique Session"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Sessions",
+        current["Sessions"],
+        previous["Sessions"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Organic & Direct",
+        current["Organic&Direct"],
+        previous["Organic&Direct"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Paid",
+        current["Paid"],
+        previous["Paid"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Paid – Search",
+        current["Paid-Search"],
+        previous["Paid-Search"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Paid – Display",
+        current["Paid-Display"],
+        previous["Paid-Display"] if previous is not None else None,
+    )
+
+    add_kpi(
+        "Influencer",
+        current["Influencer"],
+        previous["Influencer"] if previous is not None else None,
+    )
+
+    # New User Rate
+    curr_rate = current["New User"] / current["User Unique Session"] if current["User Unique Session"] else None
+    prev_rate = (
+        previous["New User"] / previous["User Unique Session"]
+        if previous is not None and previous["User Unique Session"]
+        else None
+    )
+
+    add_kpi("New User Rate", curr_rate, prev_rate)
+
+    return kpis
+
+def format_value(name, value):
+    if value is None or pd.isna(value):
+        return "–"
+
+    if name == "New User Rate":
+        return f"{value:.1%}"
+
+    return f"{int(round(value)):,}".replace(",", ".")
+
+
+def format_delta(delta):
+    if delta is None:
+        return "N/A", "neutral"
+
+    sign = "+" if delta >= 0 else ""
+    color = "green" if delta >= 0 else "red"
+    return f"{sign}{delta:.1f}%", color
+
+
+def render_kpis(kpis: dict):
+    cols = st.columns(4)
+
+    for i, (name, data) in enumerate(kpis.items()):
+        with cols[i % 4]:
+            delta_text, color = format_delta(data["delta"])
+            st.metric(
+                label=name,
+                value=format_value(name, data["value"]),
+                delta=delta_text,
+                delta_color=color,
+            )
+
+current_row, previous_row = get_current_and_previous(agg_view)
+kpis = calculate_kpis(current_row, previous_row)
+
+st.subheader("Trafik – KPI Özeti")
+render_kpis(kpis)
+
