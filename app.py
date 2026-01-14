@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
 # ============================================================
 # CONFIG
@@ -369,3 +370,91 @@ with st.expander("Aggregated preview (filtered)"):
 
 with st.expander("Raw preview (first 50)"):
     st.dataframe(df_raw.head(50), use_container_width=True)
+
+
+# ------------------------------------------------
+# PART 5: Graph Engine
+# ------------------------------------------------
+st.divider()
+st.subheader("Trafik — Trend & Kanal Dağılımı")
+
+# ------------------------------------------------
+# Prepare plotting dataframe
+# ------------------------------------------------
+plot_df = agg_view.copy()
+
+# X axis label
+x_col = "period_label"
+
+# ------------------------------------------------
+# 1) Total Unique Session Trend
+# ------------------------------------------------
+fig_total = px.line(
+    plot_df,
+    x=x_col,
+    y="User Unique Session",
+    markers=True,
+    title="Total Unique Session Trend",
+)
+
+fig_total.update_layout(
+    yaxis_title="User Unique Session",
+    xaxis_title="",
+    hovermode="x unified",
+)
+
+st.plotly_chart(fig_total, use_container_width=True)
+
+# ------------------------------------------------
+# 2) Trafik by Type (Multi-line)
+# ------------------------------------------------
+traffic_long = plot_df.melt(
+    id_vars=[x_col],
+    value_vars=["Organic&Direct", "Paid", "Influencer"],
+    var_name="Channel",
+    value_name="Sessions",
+)
+
+fig_channel = px.line(
+    traffic_long,
+    x=x_col,
+    y="Sessions",
+    color="Channel",
+    markers=True,
+    title="Trafik by Type",
+)
+
+fig_channel.update_layout(
+    yaxis_title="Sessions",
+    xaxis_title="",
+    hovermode="x unified",
+)
+
+st.plotly_chart(fig_channel, use_container_width=True)
+
+# ------------------------------------------------
+# 3) Paid Mix (Search vs Display)
+# ------------------------------------------------
+paid_long = plot_df.melt(
+    id_vars=[x_col],
+    value_vars=["Paid-Search", "Paid-Display"],
+    var_name="Paid Type",
+    value_name="Sessions",
+)
+
+fig_paid = px.bar(
+    paid_long,
+    x=x_col,
+    y="Sessions",
+    color="Paid Type",
+    title="Paid Mix — Search vs Display",
+    barmode="stack",
+)
+
+fig_paid.update_layout(
+    yaxis_title="Sessions",
+    xaxis_title="",
+    hovermode="x unified",
+)
+
+st.plotly_chart(fig_paid, use_container_width=True)
