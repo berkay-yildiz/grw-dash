@@ -183,7 +183,7 @@ def apply_default_range(agg: pd.DataFrame, granularity: str, weeks_back: int = 8
 # STREAMLIT UI (STEP 3 VALIDATION)
 # ============================================================
 st.set_page_config(page_title="Trafik Dashboard - Step 3", layout="wide")
-st.title("Trafik Dashboard (Step 3: Data Engine)")
+st.title("Trafik Dashboard")
 
 st.sidebar.header("Data Source")
 uploaded = st.sidebar.file_uploader("Upload grw_dash.xlsx", type=["xlsx"])
