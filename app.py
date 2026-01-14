@@ -321,70 +321,39 @@ def render_kpis(kpis: list[dict], compare_label: str):
         with cols[i % 4]:
             st.metric(label=name, value=value_str, delta=delta_str, delta_color=delta_color)
 
-# ============================================================
-# UI
-# ============================================================
-st.set_page_config(page_title="GRW Dash - Trafik (Step 4)", layout="wide")
-st.title("GRW Dash — Trafik (Step 4)")
-
-with st.sidebar:
-    st.header("Data Source")
-    uploaded = st.file_uploader("Upload grw_dash.xlsx", type=["xlsx"])
-    if uploaded is None:
-        st.info("Excel dosyasını yükleyin. (Sheet adı: Traffic)")
-        st.stop()
-
-# Load data
-try:
-    df_raw = load_from_excel(uploaded)
-except Exception as e:
-    st.error("Dosya okunamadı veya sheet/kolon yapısı beklenen formatta değil.")
-    st.exception(e)
-    st.stop()
-
-with st.sidebar:
-    st.header("Filters")
-
-    granularity = st.radio("Granularity", ["Weekly", "Daily", "Monthly"], index=0)
-    weeks_back = st.slider("Default range (weeks)", min_value=4, max_value=26, value=8, step=1)
-
-    compare_mode = st.selectbox("Compare mode", ["WoW", "MoM", "YoY"], index=0)
-
-# Aggregate (all + view)
-agg_all = aggregate(df_raw, granularity=granularity)
-agg_view = apply_default_range(agg_all, granularity=granularity, weeks_back=weeks_back)
-
-# Current & Previous
-current_row = _pick_current_period(agg_view)
-previous_row = _find_prev_row(agg_all, current_row, granularity=granularity, compare_mode=compare_mode)
-
-# KPI compute + render
-st.subheader("Trafik — KPI Özeti")
-compare_label = f"{granularity} / {compare_mode}"
-kpis = calculate_kpis(current_row, previous_row)
-render_kpis(kpis, compare_label=compare_label)
-
-# Debug / Preview
-with st.expander("Aggregated preview (filtered)"):
-    st.dataframe(agg_view, use_container_width=True)
-
-with st.expander("Raw preview (first 50)"):
-    st.dataframe(df_raw.head(50), use_container_width=True)
-
-
-# ------------------------------------------------
-# PART 5: Graph Engine
-# ------------------------------------------------
 st.divider()
 st.subheader("Trafik — Trend & Kanal Dağılımı")
 
 # ------------------------------------------------
-# Prepare plotting dataframe
+# Prepare plotting dataframe (robust)
 # ------------------------------------------------
 plot_df = agg_view.copy()
 
-# X axis label
-x_col = "period_label"
+# pick best x column available
+if "period_label" in plot_df.columns:
+    x_col = "period_label"
+elif "period" in plot_df.columns:
+    x_col = "period"
+else:
+    # last resort: create one
+    plot_df = plot_df.reset_index(drop=True)
+    plot_df["period_label"] = plot_df.index.astype(str)
+    x_col = "period_label"
+
+# Ensure expected metric columns exist (avoid KeyError/melt errors)
+needed_metrics = [
+    "User Unique Session",
+    "Organic&Direct",
+    "Paid",
+    "Influencer",
+    "Paid-Search",
+    "Paid-Display",
+]
+missing_metrics = [c for c in needed_metrics if c not in plot_df.columns]
+if missing_metrics:
+    st.error(f"Grafikler için eksik kolonlar var: {missing_metrics}")
+    st.info("Aggregated preview'de kolon isimlerini kontrol et.")
+    st.stop()
 
 # ------------------------------------------------
 # 1) Total Unique Session Trend
@@ -396,21 +365,14 @@ fig_total = px.line(
     markers=True,
     title="Total Unique Session Trend",
 )
-
-fig_total.update_layout(
-    yaxis_title="User Unique Session",
-    xaxis_title="",
-    hovermode="x unified",
-)
-
+fig_total.update_layout(yaxis_title="User Unique Session", xaxis_title="", hovermode="x unified")
 st.plotly_chart(fig_total, use_container_width=True)
 
 # ------------------------------------------------
 # 2) Trafik by Type (Multi-line)
 # ------------------------------------------------
-traffic_long = plot_df.melt(
+traffic_long = plot_df[[x_col, "Organic&Direct", "Paid", "Influencer"]].melt(
     id_vars=[x_col],
-    value_vars=["Organic&Direct", "Paid", "Influencer"],
     var_name="Channel",
     value_name="Sessions",
 )
@@ -423,21 +385,14 @@ fig_channel = px.line(
     markers=True,
     title="Trafik by Type",
 )
-
-fig_channel.update_layout(
-    yaxis_title="Sessions",
-    xaxis_title="",
-    hovermode="x unified",
-)
-
+fig_channel.update_layout(yaxis_title="Sessions", xaxis_title="", hovermode="x unified")
 st.plotly_chart(fig_channel, use_container_width=True)
 
 # ------------------------------------------------
 # 3) Paid Mix (Search vs Display)
 # ------------------------------------------------
-paid_long = plot_df.melt(
+paid_long = plot_df[[x_col, "Paid-Search", "Paid-Display"]].melt(
     id_vars=[x_col],
-    value_vars=["Paid-Search", "Paid-Display"],
     var_name="Paid Type",
     value_name="Sessions",
 )
@@ -450,11 +405,6 @@ fig_paid = px.bar(
     title="Paid Mix — Search vs Display",
     barmode="stack",
 )
-
-fig_paid.update_layout(
-    yaxis_title="Sessions",
-    xaxis_title="",
-    hovermode="x unified",
-)
-
+fig_paid.update_layout(yaxis_title="Sessions", xaxis_title="", hovermode="x unified")
 st.plotly_chart(fig_paid, use_container_width=True)
+
